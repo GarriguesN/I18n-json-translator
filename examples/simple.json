@@ -1,0 +1,22 @@
+{
+  "welcome": "Welcome to our application",
+  "goodbye": "Goodbye, see you soon!",
+  "login": "Login",
+  "logout": "Logout",
+  "username": "Username",
+  "password": "Password",
+  "email": "Email address",
+  "submit": "Submit",
+  "cancel": "Cancel",
+  "save": "Save changes",
+  "delete": "Delete",
+  "edit": "Edit",
+  "search": "Search",
+  "filter": "Filter results",
+  "loading": "Loading...",
+  "error": "An error occurred",
+  "success": "Operation completed successfully",
+  "confirm": "Are you sure?",
+  "yes": "Yes",
+  "no": "No"
+}

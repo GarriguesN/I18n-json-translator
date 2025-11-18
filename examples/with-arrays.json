@@ -1,0 +1,53 @@
+{
+  "menu": {
+    "items": [
+      "Home",
+      "About Us",
+      "Services",
+      "Contact",
+      "Blog"
+    ]
+  },
+  "features": {
+    "list": [
+      "Easy to use interface",
+      "Fast performance",
+      "Secure authentication",
+      "24/7 customer support",
+      "Regular updates"
+    ],
+    "descriptions": {
+      "feature1": "Our platform is designed with simplicity in mind",
+      "feature2": "Experience lightning-fast load times",
+      "feature3": "Your data is encrypted and protected",
+      "feature4": "We're here to help whenever you need us",
+      "feature5": "Continuous improvements and new features"
+    }
+  },
+  "testimonials": [
+    {
+      "name": "John Doe",
+      "comment": "This is the best service I've ever used!",
+      "rating": "5 stars"
+    },
+    {
+      "name": "Jane Smith",
+      "comment": "Highly recommended for everyone",
+      "rating": "5 stars"
+    }
+  ],
+  "faq": [
+    {
+      "question": "How do I get started?",
+      "answer": "Simply sign up for a free account and follow the onboarding tutorial"
+    },
+    {
+      "question": "Is there a free trial?",
+      "answer": "Yes! We offer a 30-day free trial with full access to all features"
+    },
+    {
+      "question": "Can I cancel anytime?",
+      "answer": "Absolutely. You can cancel your subscription at any time without penalty"
+    }
+  ]
+}
