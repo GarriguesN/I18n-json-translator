@@ -34,7 +34,8 @@ SUPPORTED_LANGUAGES = {
     'pl': 'Polish',
     'sv': 'Swedish',
     'tr': 'Turkish',
-    'vi': 'Vietnamese'
+    'vi': 'Vietnamese', 
+	'ca': 'Catalan',
 }
 
 
