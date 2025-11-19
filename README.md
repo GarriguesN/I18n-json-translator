@@ -6,7 +6,7 @@
 
 A powerful Python CLI tool that automatically translates JSON files for internationalization (i18n) using free translation APIs. Perfect for quickly creating multilingual versions of your application's language files.
 
-**🚀 No API keys required • ✨ 17+ languages • 🎯 Smart placeholder preservation • 📦 Batch translation**
+**🚀 No API keys required • ✨ 17+ languages • 🎯 Smart placeholder preservation • 📦 Batch + ⚡ Parallel + 🧩 Cache**
 
 ## 🎯 Features
 
@@ -15,7 +15,9 @@ A powerful Python CLI tool that automatically translates JSON files for internat
 🧠 **Auto-Detection** - Automatically detects source language from JSON content  
 🔄 **Preserves Structure** - Maintains nested JSON structures and arrays  
 🎯 **Smart Placeholders** - Preserves interpolation variables: `{{name}}`, `{0}`, `%s`, `${var}`  
-📦 **Batch Translation** - Translate to multiple languages in one command  
+📦 **Batch Translation** - Translate to multiple languages in one command & group strings for fewer API calls  
+⚡ **Parallel Execution** - Multi-threaded batch processing (configurable workers)  
+🧩 **Persistent Cache** - Reuses previously translated strings instantly  
 ⚡ **Easy to Use** - Simple CLI interface with helpful options  
 🛠️ **Framework Agnostic** - Works with React i18next, Vue i18n, Angular, Flutter, and more  
 
@@ -94,6 +96,29 @@ python translator.py input.json -t es -v
 View all available language codes:
 ```bash
 python translator.py --list-languages
+```
+
+### Performance Tuning
+
+Adjust batch size (strings per group) & number of parallel workers:
+```bash
+python translator.py input.json -t es --batch-size 20 --max-workers 5
+```
+
+Disable cache (forces re-translation):
+```bash
+python translator.py input.json -t es --no-cache
+```
+
+Recommended ranges:
+- `--batch-size`: 10–20 (default 15)
+- `--max-workers`: 2–4 (default 3)
+
+Cache file: `.translation_cache.db` (auto-created, safe to commit or share)
+
+High-performance multi-language with verbose output:
+```bash
+python translator.py messages.json -s en -t es fr de it pt --batch-size 18 --max-workers 4 -v
 ```
 
 ## Supported Languages
@@ -210,14 +235,27 @@ This creates:
 - `app.fr.json` (French)
 - `app.de.json` (German)
 
+### Example 4: Performance & Cache
+Initial (no cache yet):
+```bash
+time python translator.py nested.json -s en -t de -v
+```
+Repeat (all strings cached):
+```bash
+time python translator.py nested.json -s en -t de -v
+```
+Sample (56 strings): first run ~2.6s, cached run ~0.16s (previous naive approach was ~22–24s).
+
 ## How It Works
 
 1. **Load JSON** - Reads and validates your input JSON file
 2. **Detect Language** (optional) - Analyzes content to identify source language
 3. **Extract Placeholders** - Identifies and protects interpolation variables
 4. **Translate** - Sends text to Google Translate via deep-translator
-5. **Restore Placeholders** - Puts back the original variables
-6. **Save** - Writes translated JSON with preserved structure
+5. **Batch / Parallel** - Groups strings and optionally uses threads
+6. **Cache Lookup** - Skips strings already translated earlier
+7. **Restore Placeholders** - Puts back the original variables
+8. **Save** - Writes translated JSON with preserved structure
 
 ## Supported Placeholder Formats
 
@@ -253,10 +291,29 @@ Examples:
 4. **Review output** - Machine translation isn't perfect; review important strings
 
 ### For Large Files
+1. Tune batch size (`--batch-size 18`) for fewer requests
+2. Use parallel workers (`--max-workers 3`) for speed
+3. Leverage cache (default on) for iterative runs
+4. Verbose mode (`-v`) shows progress & cache hits
+5. Version control: commit original before translating
 
-1. **Use verbose mode** (`-v`) to track progress
-2. **Translate incrementally** - Break large files into smaller sections
-3. **Version control** - Commit original before translating
+## Performance (v1.1.0)
+
+| Scenario | Strings | First Run (No Cache) | Cached Repeat |
+|----------|---------|----------------------|---------------|
+| Simple file | 20 | ~1s | <0.15s |
+| Nested file | 56 | ~2.6s | ~0.16s |
+| Previous (pre-optimizations) | 56 | ~22–24s | N/A |
+
+Optimizations:
+- Batch grouping reduces API overhead
+- Parallel threads speed up batch processing
+- Persistent SQLite cache provides O(1) reuse
+
+Tips:
+- Increase `--batch-size` until no further speed gains
+- Avoid too many workers (>5) to reduce rate-limit risk
+- Cache file can be shared to seed translations
 
 ### Common i18n Patterns
 
@@ -321,9 +378,10 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
 
 Some ideas for contributions:
 - Add support for more translation services (DeepL, Azure, etc.)
-- Implement translation caching
 - Add YAML/TOML format support
-- Improve performance with batch API calls
+- Glossary / translation memory
+- Diff mode (only new keys) implementation
+- DeepL optional integration
 - Add more placeholder patterns
 
 ## 📄 License

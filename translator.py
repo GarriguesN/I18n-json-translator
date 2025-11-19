@@ -8,8 +8,13 @@ import json
 import re
 import argparse
 import sys
+import sqlite3
+import hashlib
+import time
+import threading
 from pathlib import Path
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from deep_translator import GoogleTranslator
 from langdetect import detect, DetectorFactory, LangDetectException
 
@@ -39,10 +44,122 @@ SUPPORTED_LANGUAGES = {
 }
 
 
+class TranslationCache:
+    """SQLite-based cache for storing and retrieving translations."""
+    
+    def __init__(self, cache_file: str = '.translation_cache.db'):
+        """
+        Initialize the translation cache.
+        
+        Args:
+            cache_file: Path to the SQLite database file
+        """
+        self.cache_file = cache_file
+        self._init_db()
+    
+    def _get_connection(self):
+        """Get a thread-local database connection."""
+        import threading
+        thread_id = threading.get_ident()
+        
+        if not hasattr(self, '_connections'):
+            self._connections = {}
+        
+        if thread_id not in self._connections:
+            conn = sqlite3.connect(self.cache_file, check_same_thread=False)
+            self._connections[thread_id] = conn
+        
+        return self._connections[thread_id]
+    
+    def _init_db(self):
+        """Create the cache database and table if they don't exist."""
+        conn = sqlite3.connect(self.cache_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS translations (
+                text_hash TEXT,
+                source_lang TEXT,
+                target_lang TEXT,
+                original_text TEXT,
+                translated_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (text_hash, source_lang, target_lang)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_hash ON translations(text_hash)')
+        conn.commit()
+        conn.close()
+    
+    def _get_hash(self, text: str) -> str:
+        """Generate a hash for the text."""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+    
+    def get(self, text: str, source_lang: str, target_lang: str) -> str:
+        """
+        Retrieve a cached translation.
+        
+        Args:
+            text: Original text
+            source_lang: Source language code
+            target_lang: Target language code
+            
+        Returns:
+            Translated text if found in cache, None otherwise
+        """
+        text_hash = self._get_hash(text)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT translated_text FROM translations WHERE text_hash = ? AND source_lang = ? AND target_lang = ?',
+            (text_hash, source_lang, target_lang)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else None
+    
+    def set(self, text: str, source_lang: str, target_lang: str, translated_text: str):
+        """
+        Store a translation in the cache.
+        
+        Args:
+            text: Original text
+            source_lang: Source language code
+            target_lang: Target language code
+            translated_text: Translated text
+        """
+        text_hash = self._get_hash(text)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT OR REPLACE INTO translations 
+               (text_hash, source_lang, target_lang, original_text, translated_text)
+               VALUES (?, ?, ?, ?, ?)''',
+            (text_hash, source_lang, target_lang, text, translated_text)
+        )
+        conn.commit()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM translations')
+        total = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(DISTINCT source_lang || "-" || target_lang) FROM translations')
+        pairs = cursor.fetchone()[0]
+        return {'total_translations': total, 'language_pairs': pairs}
+    
+    def close(self):
+        """Close all database connections."""
+        if hasattr(self, '_connections'):
+            for conn in self._connections.values():
+                conn.close()
+            self._connections.clear()
+
+
 class JSONTranslator:
     """Handles translation of JSON files while preserving structure and placeholders."""
     
-    def __init__(self, source_lang: str = 'auto', target_lang: str = 'es', verbose: bool = False):
+    def __init__(self, source_lang: str = 'auto', target_lang: str = 'es', verbose: bool = False, 
+                 use_cache: bool = True, max_workers: int = 3):
         """
         Initialize the translator.
         
@@ -50,12 +167,20 @@ class JSONTranslator:
             source_lang: Source language code ('auto' for auto-detection)
             target_lang: Target language code
             verbose: Enable verbose output
+            use_cache: Enable translation cache
+            max_workers: Number of parallel translation threads (2-5 recommended)
         """
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.verbose = verbose
+        self.use_cache = use_cache
+        self.max_workers = max_workers
         self.translator = None
+        self._translators = {}  # Thread-local translators
+        self._lock = threading.Lock()
         self.translation_count = 0
+        self.cache_hits = 0
+        self.cache = TranslationCache() if use_cache else None
         
         # Regex patterns for preserving interpolation placeholders
         self.placeholder_patterns = [
@@ -74,6 +199,18 @@ class JSONTranslator:
             self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
         except Exception as e:
             raise Exception(f"Failed to initialize translator: {str(e)}")
+    
+    def _get_translator(self):
+        """Get a thread-safe translator instance."""
+        thread_id = threading.get_ident()
+        if thread_id not in self._translators:
+            with self._lock:
+                if thread_id not in self._translators:
+                    self._translators[thread_id] = GoogleTranslator(
+                        source=self.source_lang, 
+                        target=self.target_lang
+                    )
+        return self._translators[thread_id]
     
     def detect_language(self, json_data: Dict[str, Any]) -> str:
         """
@@ -177,6 +314,13 @@ class JSONTranslator:
         if not text or not text.strip():
             return text
         
+        # Check cache first
+        if self.cache:
+            cached = self.cache.get(text, self.source_lang, self.target_lang)
+            if cached:
+                self.cache_hits += 1
+                return cached
+        
         # Extract placeholders
         processed_text, placeholders = self._extract_placeholders(text)
         
@@ -188,9 +332,13 @@ class JSONTranslator:
             if placeholders:
                 translated = self._restore_placeholders(translated, placeholders)
             
+            # Store in cache
+            if self.cache:
+                self.cache.set(text, self.source_lang, self.target_lang, translated)
+            
             self.translation_count += 1
             if self.verbose and self.translation_count % 10 == 0:
-                print(f"Translated {self.translation_count} strings...")
+                print(f"Translated {self.translation_count} strings... (cache hits: {self.cache_hits})")
             
             return translated
         except Exception as e:
@@ -198,9 +346,82 @@ class JSONTranslator:
                 print(f"Warning: Failed to translate '{text[:50]}...': {str(e)}", file=sys.stderr)
             return text  # Return original text on failure
     
+    def _translate_single_indexed(self, index: int, text: str) -> Tuple[int, str]:
+        """
+        Translate a single text with index for parallel processing.
+        Thread-safe with isolated translator instance.
+        
+        Args:
+            index: Original position index
+            text: Text to translate
+            
+        Returns:
+            Tuple of (index, translated_text)
+        """
+        if not text or not text.strip():
+            return (index, text)
+        
+        # Check cache first (thread-safe)
+        if self.cache:
+            cached = self.cache.get(text, self.source_lang, self.target_lang)
+            if cached:
+                with self._lock:
+                    self.cache_hits += 1
+                return (index, cached)
+        
+        # Extract placeholders
+        processed, placeholders = self._extract_placeholders(text)
+        
+        try:
+            # Get thread-safe translator
+            translator = self._get_translator()
+            translated = translator.translate(processed)
+            
+            if placeholders:
+                translated = self._restore_placeholders(translated, placeholders)
+            
+            # Store in cache (thread-safe)
+            if self.cache:
+                self.cache.set(text, self.source_lang, self.target_lang, translated)
+            
+            with self._lock:
+                self.translation_count += 1
+            
+            return (index, translated)
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: Failed to translate '{text[:40]}': {e}", file=sys.stderr)
+            return (index, text)
+    
+    def _collect_all_strings(self, data: Any) -> List[Tuple[List[Any], Any, str]]:
+        """
+        Collect all translatable strings from JSON with their paths.
+        
+        Args:
+            data: The JSON data to traverse
+            
+        Returns:
+            List of tuples: (path, parent, key/index, value)
+        """
+        strings = []
+        
+        def traverse(obj, path=[]):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    traverse(value, path + [('dict', obj, key)])
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    traverse(item, path + [('list', obj, i)])
+            elif isinstance(obj, str) and obj.strip():
+                strings.append((path, obj))
+        
+        traverse(data)
+        return strings
+    
     def translate_json(self, data: Any) -> Any:
         """
         Recursively translate JSON data while preserving structure.
+        Uses batch translation and threading for optimal performance.
         
         Args:
             data: The JSON data to translate
@@ -208,15 +429,82 @@ class JSONTranslator:
         Returns:
             Translated JSON data
         """
-        if isinstance(data, dict):
-            return {key: self.translate_json(value) for key, value in data.items()}
-        elif isinstance(data, list):
-            return [self.translate_json(item) for item in data]
-        elif isinstance(data, str):
-            return self.translate_text(data)
+        import copy
+        
+        # Create a deep copy to avoid modifying original
+        result = copy.deepcopy(data)
+        
+        # Collect all strings with their paths
+        string_data = self._collect_all_strings(result)
+        
+        if not string_data:
+            return result
+        
+        # Extract just the strings for translation
+        strings_to_translate = [item[1] for item in string_data]
+        
+        if self.verbose:
+            print(f"Translating {len(strings_to_translate)} strings using parallel mode (workers={self.max_workers})...")
+        
+        # Prepare ordered result container
+        translated_strings = [None] * len(strings_to_translate)
+        
+        # Parallel execution with indexed results for guaranteed order
+        if self.max_workers > 1:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all translations with their indices
+                futures = {
+                    executor.submit(self._translate_single_indexed, idx, text): idx 
+                    for idx, text in enumerate(strings_to_translate)
+                }
+                
+                completed_count = 0
+                for future in as_completed(futures):
+                    try:
+                        idx, translated = future.result()
+                        translated_strings[idx] = translated
+                        completed_count += 1
+                        
+                        if self.verbose and completed_count % 15 == 0:
+                            print(f"Progress: {completed_count}/{len(strings_to_translate)} strings translated")
+                    except Exception as e:
+                        idx = futures[future]
+                        if self.verbose:
+                            print(f"Warning: Translation failed at index {idx}: {e}", file=sys.stderr)
+                        translated_strings[idx] = strings_to_translate[idx]
+                
+                if self.verbose:
+                    print(f"Progress: {len(strings_to_translate)}/{len(strings_to_translate)} strings translated")
         else:
-            # Return other types (numbers, booleans, null) as-is
-            return data
+            # Sequential fallback
+            for idx, text in enumerate(strings_to_translate):
+                _, translated = self._translate_single_indexed(idx, text)
+                translated_strings[idx] = translated
+                if self.verbose and (idx + 1) % 15 == 0:
+                    print(f"Progress: {idx + 1}/{len(strings_to_translate)} strings translated")
+            if self.verbose:
+                print(f"Progress: {len(strings_to_translate)}/{len(strings_to_translate)} strings translated")
+        
+        # Apply translations back to the data structure
+        for i, (path, original) in enumerate(string_data):
+            if i < len(translated_strings):
+                # Navigate to the location and update
+                current = result
+                for path_type, parent, key in path:
+                    if path_type == 'dict':
+                        if key in parent:
+                            current = parent
+                            break
+                    elif path_type == 'list':
+                        current = parent
+                        break
+                
+                # Update the value
+                if path:
+                    path_type, parent, key = path[-1]
+                    parent[key] = translated_strings[i]
+        
+        return result
     
     def translate_file(self, input_path: Path, output_path: Path):
         """
@@ -246,6 +534,9 @@ class JSONTranslator:
         # Translate the data
         if self.verbose:
             print(f"Translating from {self.source_lang} to {self.target_lang}...")
+            if self.cache:
+                stats = self.cache.get_stats()
+                print(f"Cache contains {stats['total_translations']} translations across {stats['language_pairs']} language pairs")
         
         translated_data = self.translate_json(data)
         
@@ -255,8 +546,15 @@ class JSONTranslator:
             json.dump(translated_data, f, ensure_ascii=False, indent=2)
         
         if self.verbose:
-            print(f"✓ Translation complete! Translated {self.translation_count} strings.")
-            print(f"Output saved to: {output_path}")
+            print(f"✓ Translation complete!")
+            print(f"  • Total strings translated: {self.translation_count}")
+            print(f"  • Cache hits: {self.cache_hits}")
+            print(f"  • New translations: {self.translation_count}")
+            print(f"  • Output saved to: {output_path}")
+        
+        # Close cache connection
+        if self.cache:
+            self.cache.close()
 
 
 def list_languages():
@@ -284,6 +582,12 @@ Examples:
   # Specify output directory
   python translator.py input.json -t es -o ./translations
   
+  # Disable cache (not recommended)
+  python translator.py input.json -t es --no-cache
+  
+  # Adjust performance settings (parallel workers)
+  python translator.py input.json -t es --max-workers 5
+  
   # List all supported languages
   python translator.py --list-languages
         """
@@ -301,6 +605,10 @@ Examples:
                         help='Enable verbose output')
     parser.add_argument('-l', '--list-languages', action='store_true',
                         help='List all supported languages and exit')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Disable translation cache')
+    parser.add_argument('--max-workers', type=int, default=3,
+                        help='Number of parallel translation threads (default: 3, range: 1-5)')
     
     args = parser.parse_args()
     
@@ -336,6 +644,11 @@ Examples:
         print(f"Use --list-languages to see supported languages", file=sys.stderr)
         return 1
     
+    # Validate performance settings
+    if args.max_workers < 1 or args.max_workers > 5:
+        print(f"Warning: max-workers should be between 1-5. Using default (3).", file=sys.stderr)
+        args.max_workers = 3
+    
     # Process translations
     output_dir = Path(args.output)
     base_name = input_path.stem
@@ -354,12 +667,15 @@ Examples:
             translator = JSONTranslator(
                 source_lang=args.source,
                 target_lang=target_lang,
-                verbose=args.verbose
+                verbose=args.verbose,
+                use_cache=not args.no_cache,
+                max_workers=args.max_workers
             )
             
             translator.translate_file(input_path, output_path)
             
-            print(f"✓ Saved to: {output_path}")
+            if not args.verbose:
+                print(f"✓ Saved to: {output_path}")
         
         print(f"\n{'='*60}")
         print(f"All translations completed successfully!")

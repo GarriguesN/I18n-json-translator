@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-11-19
+
+### 🚀 Performance & Scalability
+
+#### Added
+- Thread-safe parallel translation with isolated translator instances per thread
+- Parallel translation with configurable workers (`--max-workers` threads)
+- Persistent SQLite translation cache (`.translation_cache.db`)
+- CLI flags: `--no-cache`, `--max-workers`
+- Detailed verbose statistics (cache hits, new translations)
+- Thread-local translator instances to prevent race conditions
+- Lock-protected counters for thread safety
+
+#### Changed
+- Translation pipeline now collects all strings, translates in parallel with indexed assignment, and leverages cache
+- Each thread gets its own GoogleTranslator instance to avoid shared state issues
+- Guaranteed translation order preservation via indexed results
+- README & FEATURES documentation updated with tuning advice and metrics
+
+#### Performance
+- Small file (84 strings): ~3.9s first run with 5 workers (was ~22–24s sequential)
+- Cached repeat: ~0.2s (all cache hits)
+- Scalable to 100+ line files in under 5 seconds
+
+#### Notes
+- Recommended workers: 3–5 for optimal speed/reliability balance
+- Cache can be disabled with `--no-cache` for fresh translations
+- Thread-safe design ensures correct translation mapping
+
+#### Technical Improvements
+- Eliminated translate_batch API (caused misaligned translations)
+- Implemented `_translate_single_indexed()` with proper thread isolation
+- Added `threading.Lock()` for shared counter protection
+- Thread-local translator storage in `_translators` dict
+
+#### Removed (Roadmap items now fulfilled)
+- Planned "Translation caching system" (implemented)
+- Planned "Batch API calls" (replaced with parallel individual translation)
+- Planned "Parallel translation requests" (implemented)
+
 ## [1.0.1] - 2025-11-19
 
 ### 🧹 Performance Optimization
@@ -78,25 +118,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Future Releases
 
-### Planned for v1.1.0
-- [ ] Translation caching system
-- [ ] DeepL API integration option
-- [ ] Batch API calls for improved performance
-- [ ] Progress bar for large files
-
 ### Planned for v1.2.0
 - [ ] YAML format support
 - [ ] TOML format support
-- [ ] Translation diff mode
-- [ ] Custom glossary support
+- [ ] Translation diff mode (only new / changed keys)
+- [ ] Custom glossary / terminology enforcement
+- [ ] Optional DeepL API integration
+- [ ] Progress bar for large files
 
 ### Planned for v2.0.0
 - [ ] Web UI interface
-- [ ] Translation memory
-- [ ] Quality scoring
-- [ ] Parallel translation requests
+- [ ] Translation memory persistence
+- [ ] Quality scoring heuristics
+- [ ] Context-aware enhancements
 - [ ] Plugin system
 
 ---
 
+[1.1.0]: https://github.com/YOUR-USERNAME/json-i18n-translator/releases/tag/v1.1.0
+[1.0.1]: https://github.com/YOUR-USERNAME/json-i18n-translator/releases/tag/v1.0.1
 [1.0.0]: https://github.com/YOUR-USERNAME/json-i18n-translator/releases/tag/v1.0.0

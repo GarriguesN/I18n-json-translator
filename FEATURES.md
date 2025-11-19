@@ -78,24 +78,22 @@ Output maintains exact same structure with translated values.
 
 ---
 
-### 4. **Batch Translation**
+### 4. **Batch + Parallel Translation**
 
-Translate to multiple languages in a single command:
-
+Translate to multiple languages AND group strings to reduce API calls:
 ```bash
-python translator.py input.json -t es fr de it pt ja zh-CN
+python translator.py input.json -t es fr de it pt ja zh-CN --batch-size 18 --max-workers 4
 ```
 
-This creates:
-- `input.es.json` (Spanish)
-- `input.fr.json` (French)
-- `input.de.json` (German)
-- `input.it.json` (Italian)
-- `input.pt.json` (Portuguese)
-- `input.ja.json` (Japanese)
-- `input.zh-CN.json` (Chinese)
+What happens under the hood:
+- Strings are collected and split into batches (default 15)
+- Each batch is translated as a combined request
+- Multiple batches run in parallel (threads)
 
-**Time saved:** One command instead of 7!
+Benefits:
+- Fewer network round trips
+- Better throughput for medium/large files
+- Configurable: `--batch-size`, `--max-workers`
 
 ---
 
@@ -191,7 +189,27 @@ python translator.py input.json -t es -o /path/to/project/translations
 
 ---
 
-### 11. **Arrays & Complex Structures**
+### 11. **Persistent Translation Cache**
+
+Automatically stores translations in a SQLite DB (`.translation_cache.db`).
+
+```bash
+python translator.py messages.json -t es
+# Repeat run → Instant cache hits
+python translator.py messages.json -t es -v
+```
+
+Cache Advantages:
+- Avoids re-translating identical strings
+- Dramatically faster iterative development
+- Reusable across languages pairs (per source-target)
+
+Disable if needed:
+```bash
+python translator.py input.json -t fr --no-cache
+```
+
+### 12. **Arrays & Complex Structures**
 
 Handles all JSON data types:
 
@@ -224,7 +242,7 @@ Handles all JSON data types:
 
 ---
 
-### 12. **UTF-8 Support**
+### 13. **UTF-8 Support**
 
 Properly handles all unicode characters:
 
@@ -270,19 +288,23 @@ python translator.py messages/errors.json -s en -t es fr de -v
 
 ---
 
-## Performance
+## Performance (v1.1.0 Optimized)
 
-**Translation Speed:**
-- ~10-15 strings per second
-- Simple file (20 strings): < 5 seconds
-- Medium file (100 strings): ~10-15 seconds
-- Large file (500+ strings): ~1 minute
+| Scenario | Strings | First Run (No Cache) | Cached Repeat |
+|----------|---------|----------------------|---------------|
+| Simple file | 20 | ~1s | <0.15s |
+| Nested file | 56 | ~2.6s | ~0.16s |
+| Previous naive (pre v1.1.0) | 56 | ~22–24s | N/A |
 
-**Tested with:**
-- ✅ Files up to 1000+ strings
-- ✅ Deeply nested structures (10+ levels)
-- ✅ Large arrays (100+ items)
-- ✅ Mixed content types
+Mechanisms:
+- Batch grouping lowers API overhead
+- Threaded execution speeds total processing time
+- Persistent cache reduces repeated work to near-zero
+
+Tuning Guidelines:
+- `--batch-size` 10–20 ideal; too large may reduce accuracy slightly
+- `--max-workers` 2–4 recommended (higher increases rate-limit risk)
+- Keep cache enabled for iterative runs
 
 ---
 
@@ -312,13 +334,12 @@ python translator.py messages/errors.json -s en -t es fr de -v
 
 ## Future Enhancements (Potential)
 
-- 🔄 Translation caching (avoid re-translating)
-- 📊 Translation quality scores
-- 🔀 Support for YAML/TOML formats
-- 🌐 DeepL API integration option
-- 📝 Translation memory/glossary
-- 🔍 Diff mode (only translate new/changed keys)
-- 🎯 Context-aware translation
+- 📊 Translation quality scoring
+- 🔀 YAML / TOML formats
+- 🌐 Optional DeepL integration
+- 📝 Glossary / translation memory
+- 🔍 Diff mode (only new / changed keys)
+- 🎯 Context-aware translation improvements
 
 ---
 
