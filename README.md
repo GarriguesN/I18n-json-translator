@@ -15,8 +15,10 @@ A powerful Python CLI tool that automatically translates JSON files for internat
 🧠 **Auto-Detection** - Automatically detects source language from JSON content  
 🔄 **Preserves Structure** - Maintains nested JSON structures and arrays  
 🎯 **Smart Placeholders** - Preserves interpolation variables: `{{name}}`, `{0}`, `%s`, `${var}`  
-📦 **Batch Translation** - Translate to multiple languages in one command & group strings for fewer API calls  
-⚡ **Parallel Execution** - Multi-threaded batch processing (configurable workers)  
+📊 **Progress Bar** - Visual feedback with tqdm (ETA, speed, completion %)  
+🔄 **Diff Mode** - Translate only new/changed keys (incremental updates)  
+📖 **Custom Glossary** - Enforce specific terminology via JSON glossary files  
+⚡ **Parallel Execution** - Multi-threaded processing (configurable workers)  
 🧩 **Persistent Cache** - Reuses previously translated strings instantly  
 ⚡ **Easy to Use** - Simple CLI interface with helpful options  
 🛠️ **Framework Agnostic** - Works with React i18next, Vue i18n, Angular, Flutter, and more  
@@ -100,9 +102,9 @@ python translator.py --list-languages
 
 ### Performance Tuning
 
-Adjust batch size (strings per group) & number of parallel workers:
+Adjust number of parallel workers:
 ```bash
-python translator.py input.json -t es --batch-size 20 --max-workers 5
+python translator.py input.json -t es --max-workers 5
 ```
 
 Disable cache (forces re-translation):
@@ -110,15 +112,35 @@ Disable cache (forces re-translation):
 python translator.py input.json -t es --no-cache
 ```
 
-Recommended ranges:
-- `--batch-size`: 10–20 (default 15)
-- `--max-workers`: 2–4 (default 3)
+### Advanced Features
+
+**Incremental translation (diff mode)**: Only translate new/changed keys
+```bash
+python translator.py input.json -t es --diff
+```
+
+**Custom terminology (glossary)**: Enforce specific terms
+```bash
+python translator.py input.json -t es --glossary my-terms.json
+```
+
+Example glossary file (`my-terms.json`):
+```json
+{
+  "Login": "Iniciar sesión",
+  "Sign up": "Registrarse",
+  "Dashboard": "Panel de control"
+}
+```
+
+Recommended settings:
+- `--max-workers`: 3–5 (default 3)
 
 Cache file: `.translation_cache.db` (auto-created, safe to commit or share)
 
-High-performance multi-language with verbose output:
+High-performance multi-language with all features:
 ```bash
-python translator.py messages.json -s en -t es fr de it pt --batch-size 18 --max-workers 4 -v
+python translator.py messages.json -s en -t es fr de --max-workers 5 --glossary terms.json -v
 ```
 
 ## Supported Languages

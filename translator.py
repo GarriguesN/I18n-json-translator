@@ -19,6 +19,12 @@ from functools import lru_cache
 from deep_translator import GoogleTranslator
 from langdetect import detect, DetectorFactory, LangDetectException
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
 # Set seed for consistent language detection results
 DetectorFactory.seed = 0
 
@@ -176,7 +182,7 @@ class JSONTranslator:
     """Handles translation of JSON files while preserving structure and placeholders."""
     
     def __init__(self, source_lang: str = 'auto', target_lang: str = 'es', verbose: bool = False, 
-                 use_cache: bool = True, max_workers: int = 3):
+                 use_cache: bool = True, max_workers: int = 3, diff_mode: bool = False, glossary: Dict[str, str] = None):
         """
         Initialize the translator.
         
@@ -186,12 +192,16 @@ class JSONTranslator:
             verbose: Enable verbose output
             use_cache: Enable translation cache
             max_workers: Number of parallel translation threads (2-5 recommended)
+            diff_mode: Only translate new/changed keys (requires existing output file)
+            glossary: Optional dict of term replacements {source_term: target_term}
         """
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.verbose = verbose
         self.use_cache = use_cache
         self.max_workers = max_workers
+        self.diff_mode = diff_mode
+        self.glossary = glossary or {}
         self.translator = None
         self._translators = {}  # Thread-local translators
         self._lock = threading.Lock()
@@ -308,6 +318,28 @@ class JSONTranslator:
         
         return result
     
+    def _apply_glossary(self, text: str) -> str:
+        """
+        Apply custom glossary terms to translated text.
+        Case-insensitive word boundary matching.
+        
+        Args:
+            text: Translated text
+            
+        Returns:
+            Text with glossary terms applied
+        """
+        if not self.glossary:
+            return text
+        
+        result = text
+        for source_term, target_term in self.glossary.items():
+            # Case-insensitive word boundary replacement
+            pattern = re.compile(r'\b' + re.escape(source_term) + r'\b', re.IGNORECASE)
+            result = pattern.sub(target_term, result)
+        
+        return result
+    
     def translate_text(self, text: str) -> str:
         """
         Translate a single text string while preserving placeholders.
@@ -387,6 +419,10 @@ class JSONTranslator:
             if placeholders:
                 translated = self._restore_placeholders(translated, placeholders)
             
+            # Apply glossary terms
+            if self.glossary:
+                translated = self._apply_glossary(translated)
+            
             # Store in cache (thread-safe)
             if self.cache:
                 self.cache.set(text, self.source_lang, self.target_lang, translated)
@@ -424,6 +460,45 @@ class JSONTranslator:
         
         traverse(data)
         return strings
+    
+    def _compute_diff(self, new_data: Any, existing_data: Any) -> Dict[str, Any]:
+        """
+        Compute which keys are new or changed between new and existing data.
+        
+        Args:
+            new_data: New source JSON data
+            existing_data: Existing translated JSON data
+            
+        Returns:
+            Dict with 'new_keys' and 'changed_keys' lists containing paths
+        """
+        new_strings = {}
+        existing_strings = {}
+        
+        def collect_with_path(obj, path="", target=None):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    new_path = f"{path}.{key}" if path else key
+                    collect_with_path(value, new_path, target)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    new_path = f"{path}[{i}]"
+                    collect_with_path(item, new_path, target)
+            elif isinstance(obj, str) and obj.strip():
+                target[path] = obj
+        
+        collect_with_path(new_data, target=new_strings)
+        collect_with_path(existing_data, target=existing_strings)
+        
+        new_keys = [k for k in new_strings if k not in existing_strings]
+        changed_keys = [k for k in new_strings if k in existing_strings and new_strings[k] != existing_strings[k]]
+        
+        return {
+            'new_keys': new_keys,
+            'changed_keys': changed_keys,
+            'new_strings': new_strings,
+            'existing_strings': existing_strings
+        }
     
     def translate_json(self, data: Any) -> Any:
         """
@@ -465,6 +540,12 @@ class JSONTranslator:
                     for idx, text in enumerate(strings_to_translate)
                 }
                 
+                # Use tqdm progress bar if available and verbose
+                if TQDM_AVAILABLE and self.verbose:
+                    pbar = tqdm(total=len(strings_to_translate), desc="Translating", unit="string")
+                else:
+                    pbar = None
+                
                 completed_count = 0
                 last_progress = 0
                 for future in as_completed(futures):
@@ -473,27 +554,39 @@ class JSONTranslator:
                         translated_strings[idx] = translated
                         completed_count += 1
                         
-                        # Reduce verbose output frequency for better performance
-                        if self.verbose and completed_count - last_progress >= 15:
+                        if pbar:
+                            pbar.update(1)
+                        elif self.verbose and completed_count - last_progress >= 15:
+                            # Fallback progress without tqdm
                             print(f"Progress: {completed_count}/{len(strings_to_translate)} strings translated")
                             last_progress = completed_count
                     except Exception as e:
                         idx = futures[future]
-                        if self.verbose:
+                        if self.verbose and not pbar:
                             print(f"Warning: Translation failed at index {idx}: {e}", file=sys.stderr)
                         translated_strings[idx] = strings_to_translate[idx]
                         completed_count += 1
+                        if pbar:
+                            pbar.update(1)
                 
-                if self.verbose:
+                if pbar:
+                    pbar.close()
+                elif self.verbose:
                     print(f"Progress: {len(strings_to_translate)}/{len(strings_to_translate)} strings translated")
         else:
             # Sequential fallback
-            for idx, text in enumerate(strings_to_translate):
+            if TQDM_AVAILABLE and self.verbose:
+                iterator = tqdm(enumerate(strings_to_translate), total=len(strings_to_translate), desc="Translating", unit="string")
+            else:
+                iterator = enumerate(strings_to_translate)
+            
+            for idx, text in iterator:
                 _, translated = self._translate_single_indexed(idx, text)
                 translated_strings[idx] = translated
-                if self.verbose and (idx + 1) % 15 == 0:
+                if not TQDM_AVAILABLE and self.verbose and (idx + 1) % 15 == 0:
                     print(f"Progress: {idx + 1}/{len(strings_to_translate)} strings translated")
-            if self.verbose:
+            
+            if not TQDM_AVAILABLE and self.verbose:
                 print(f"Progress: {len(strings_to_translate)}/{len(strings_to_translate)} strings translated")
         
         # Apply translations back to the data structure
@@ -534,6 +627,19 @@ class JSONTranslator:
         except Exception as e:
             raise Exception(f"Failed to read file: {str(e)}")
         
+        # Check for diff mode
+        existing_data = None
+        if self.diff_mode and output_path.exists():
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                if self.verbose:
+                    print(f"Diff mode: Loading existing translation from {output_path}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: Could not load existing file for diff: {e}")
+                existing_data = None
+        
         # Auto-detect source language if needed
         if self.source_lang == 'auto':
             detected_lang = self.detect_language(data)
@@ -549,7 +655,40 @@ class JSONTranslator:
                 stats = self.cache.get_stats()
                 print(f"Cache contains {stats['total_translations']} translations across {stats['language_pairs']} language pairs")
         
-        translated_data = self.translate_json(data)
+        # Diff mode: detect structural changes
+        if self.diff_mode and existing_data:
+            # Compare structure: check if keys match
+            def get_structure(obj, path=""):
+                keys = set()
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        new_path = f"{path}.{key}" if path else key
+                        keys.add(new_path)
+                        keys.update(get_structure(value, new_path))
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        new_path = f"{path}[{i}]"
+                        keys.add(new_path)
+                        keys.update(get_structure(item, new_path))
+                return keys
+            
+            source_keys = get_structure(data)
+            existing_keys = get_structure(existing_data)
+            new_keys = source_keys - existing_keys
+            removed_keys = existing_keys - source_keys
+            
+            if self.verbose:
+                print(f"Diff analysis: {len(new_keys)} new keys, {len(removed_keys)} removed keys")
+            
+            if len(new_keys) == 0:
+                if self.verbose:
+                    print("No structural changes detected. Using existing translation.")
+                translated_data = existing_data
+            else:
+                # Translate and merge
+                translated_data = self.translate_json(data)
+        else:
+            translated_data = self.translate_json(data)
         
         # Write output file
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -620,6 +759,10 @@ Examples:
                         help='Disable translation cache')
     parser.add_argument('--max-workers', type=int, default=3,
                         help='Number of parallel translation threads (default: 3, range: 1-5)')
+    parser.add_argument('--diff', action='store_true',
+                        help='Translate only new or changed keys (compares with existing output)')
+    parser.add_argument('--glossary', type=str,
+                        help='Path to JSON glossary file for custom terminology {"term": "translation"}')
     
     args = parser.parse_args()
     
@@ -664,6 +807,22 @@ Examples:
     output_dir = Path(args.output)
     base_name = input_path.stem
     
+    # Load glossary if provided
+    glossary = None
+    if args.glossary:
+        glossary_path = Path(args.glossary)
+        if not glossary_path.exists():
+            print(f"Error: Glossary file not found: {glossary_path}", file=sys.stderr)
+            return 1
+        try:
+            with open(glossary_path, 'r', encoding='utf-8') as f:
+                glossary = json.load(f)
+            if args.verbose:
+                print(f"Loaded glossary with {len(glossary)} terms from {glossary_path}")
+        except Exception as e:
+            print(f"Error loading glossary: {e}", file=sys.stderr)
+            return 1
+    
     try:
         for target_lang in args.target:
             print(f"\n{'='*60}")
@@ -680,7 +839,9 @@ Examples:
                 target_lang=target_lang,
                 verbose=args.verbose,
                 use_cache=not args.no_cache,
-                max_workers=args.max_workers
+                max_workers=args.max_workers,
+                diff_mode=args.diff,
+                glossary=glossary
             )
             
             translator.translate_file(input_path, output_path)
