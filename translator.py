@@ -182,7 +182,8 @@ class JSONTranslator:
     """Handles translation of JSON files while preserving structure and placeholders."""
     
     def __init__(self, source_lang: str = 'auto', target_lang: str = 'es', verbose: bool = False, 
-                 use_cache: bool = True, max_workers: int = 3, diff_mode: bool = False, glossary: Dict[str, str] = None):
+                 use_cache: bool = True, max_workers: int = 3, diff_mode: bool = False, glossary: Dict[str, str] = None,
+                 batch_size: int = 0):
         """
         Initialize the translator.
         
@@ -194,6 +195,7 @@ class JSONTranslator:
             max_workers: Number of parallel translation threads (2-5 recommended)
             diff_mode: Only translate new/changed keys (requires existing output file)
             glossary: Optional dict of term replacements {source_term: target_term}
+            batch_size: Number of strings per super-batch (0=disabled, 20-50 recommended for large files)
         """
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -202,6 +204,7 @@ class JSONTranslator:
         self.max_workers = max_workers
         self.diff_mode = diff_mode
         self.glossary = glossary or {}
+        self.batch_size = batch_size
         self.translator = None
         self._translators = {}  # Thread-local translators
         self._lock = threading.Lock()
@@ -436,6 +439,38 @@ class JSONTranslator:
                 print(f"Warning: Failed to translate '{text[:40]}': {e}", file=sys.stderr)
             return (index, text)
     
+    def _process_super_batch(self, batch_info: Tuple[int, int, List[str]]) -> List[Tuple[int, str]]:
+        """
+        Process a super-batch of strings with its own thread pool.
+        
+        Args:
+            batch_info: Tuple of (start_index, batch_id, strings)
+            
+        Returns:
+            List of (index, translated_text) tuples
+        """
+        start_index, batch_id, strings = batch_info
+        results = []
+        
+        # Use thread pool for this super-batch
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(self._translate_single_indexed, start_index + idx, text): idx
+                for idx, text in enumerate(strings)
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    idx = futures[future]
+                    if self.verbose:
+                        print(f"Warning: Super-batch {batch_id} failed at index {idx}: {e}", file=sys.stderr)
+                    results.append((start_index + idx, strings[idx]))
+        
+        return results
+    
     def _collect_all_strings(self, data: Any) -> List[Tuple[List[Any], Any, str]]:
         """
         Collect all translatable strings from JSON with their paths.
@@ -526,13 +561,63 @@ class JSONTranslator:
         strings_to_translate = [item[1] for item in string_data]
         
         if self.verbose:
-            print(f"Translating {len(strings_to_translate)} strings using parallel mode (workers={self.max_workers})...")
+            if self.batch_size > 0:
+                print(f"Translating {len(strings_to_translate)} strings using 2-level batching (super-batch={self.batch_size}, workers={self.max_workers})...")
+            else:
+                print(f"Translating {len(strings_to_translate)} strings using parallel mode (workers={self.max_workers})...")
         
         # Prepare ordered result container
         translated_strings = [None] * len(strings_to_translate)
         
-        # Parallel execution with indexed results for guaranteed order
-        if self.max_workers > 1:
+        # 2-level batching: super-batches processed in parallel, each with thread pool
+        if self.batch_size > 0 and len(strings_to_translate) > self.batch_size:
+            # Divide into super-batches
+            super_batches = []
+            for i in range(0, len(strings_to_translate), self.batch_size):
+                batch_strings = strings_to_translate[i:i + self.batch_size]
+                super_batches.append((i, len(super_batches), batch_strings))
+            
+            if self.verbose:
+                print(f"Created {len(super_batches)} super-batches of ~{self.batch_size} strings each")
+            
+            # Process super-batches in parallel
+            if TQDM_AVAILABLE and self.verbose:
+                pbar = tqdm(total=len(strings_to_translate), desc="Translating", unit="string")
+            else:
+                pbar = None
+            
+            # Use process pool or sequential depending on super-batch count
+            if len(super_batches) > 1:
+                with ThreadPoolExecutor(max_workers=min(len(super_batches), 4)) as super_executor:
+                    super_futures = {
+                        super_executor.submit(self._process_super_batch, batch_info): batch_info[1]
+                        for batch_info in super_batches
+                    }
+                    
+                    for future in as_completed(super_futures):
+                        try:
+                            batch_results = future.result()
+                            for idx, translated in batch_results:
+                                translated_strings[idx] = translated
+                                if pbar:
+                                    pbar.update(1)
+                        except Exception as e:
+                            batch_id = super_futures[future]
+                            if self.verbose and not pbar:
+                                print(f"Warning: Super-batch {batch_id} failed: {e}", file=sys.stderr)
+            else:
+                # Single super-batch, process directly
+                batch_results = self._process_super_batch(super_batches[0])
+                for idx, translated in batch_results:
+                    translated_strings[idx] = translated
+                    if pbar:
+                        pbar.update(1)
+            
+            if pbar:
+                pbar.close()
+        
+        # Standard parallel execution (no super-batching)
+        elif self.max_workers > 1:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all translations with their indices
                 futures = {
@@ -759,6 +844,8 @@ Examples:
                         help='Disable translation cache')
     parser.add_argument('--max-workers', type=int, default=3,
                         help='Number of parallel translation threads (default: 3, range: 1-5)')
+    parser.add_argument('--batch-size', type=int, default=0,
+                        help='Super-batch size for 2-level parallelism (default: 0=disabled, 20-50 for large files)')
     parser.add_argument('--diff', action='store_true',
                         help='Translate only new or changed keys (compares with existing output)')
     parser.add_argument('--glossary', type=str,
@@ -841,7 +928,8 @@ Examples:
                 use_cache=not args.no_cache,
                 max_workers=args.max_workers,
                 diff_mode=args.diff,
-                glossary=glossary
+                glossary=glossary,
+                batch_size=args.batch_size
             )
             
             translator.translate_file(input_path, output_path)

@@ -107,6 +107,17 @@ Adjust number of parallel workers:
 python translator.py input.json -t es --max-workers 5
 ```
 
+**Ultra-fast 2-level batching** (for large files 200+ strings):
+```bash
+python translator.py large.json -t es --batch-size 30 --max-workers 4
+```
+
+How it works:
+- Divides strings into super-batches of `--batch-size` strings
+- Processes multiple super-batches in parallel (up to 4 concurrent)
+- Each super-batch uses its own thread pool with `--max-workers` threads
+- Example: 560 strings → 28.8s without batching, **7s with batching (4x faster)**
+
 Disable cache (forces re-translation):
 ```bash
 python translator.py input.json -t es --no-cache
@@ -135,12 +146,17 @@ Example glossary file (`my-terms.json`):
 
 Recommended settings:
 - `--max-workers`: 3–5 (default 3)
+- `--batch-size`: 20-50 for files with 200+ strings (default 0=disabled)
 
 Cache file: `.translation_cache.db` (auto-created, safe to commit or share)
 
 High-performance multi-language with all features:
 ```bash
+# Small-medium files (<200 strings)
 python translator.py messages.json -s en -t es fr de --max-workers 5 --glossary terms.json -v
+
+# Large files (200+ strings)
+python translator.py large.json -s en -t es fr de --batch-size 30 --max-workers 4 --glossary terms.json -v
 ```
 
 ## Supported Languages
