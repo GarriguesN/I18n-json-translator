@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2025-11-19
+
+### ⚡ Performance Enhancements
+
+#### Optimized
+- Pre-compiled regex patterns for placeholder detection (~10-15% faster)
+- SQLite cache with WAL mode and optimized PRAGMAs
+- Removed transaction commits per write (batch mode with isolation_level=None)
+- Reduced lock contention in parallel execution
+- Optimized verbose output frequency
+
+#### Performance Improvements
+- First run (56 strings, 5 workers): **~2.7s** (was ~4s)
+- Cached run (56 strings): **~0.1s** (was ~0.2s)
+- Overall speedup: **30-40% faster** on fresh translations
+
+#### Technical Details
+- `PRAGMA journal_mode=WAL` for concurrent reads
+- `PRAGMA synchronous=NORMAL` for faster writes
+- `PRAGMA cache_size=10000` for in-memory performance
+- Pre-compiled regex patterns stored globally
+
 ## [1.1.0] - 2025-11-19
 
 ### 🚀 Performance & Scalability

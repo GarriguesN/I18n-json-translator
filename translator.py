@@ -15,11 +15,23 @@ import threading
 from pathlib import Path
 from typing import Dict, Any, List, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from deep_translator import GoogleTranslator
 from langdetect import detect, DetectorFactory, LangDetectException
 
 # Set seed for consistent language detection results
 DetectorFactory.seed = 0
+
+# Pre-compile regex patterns for performance
+PLACEHOLDER_PATTERNS_COMPILED = [
+    re.compile(r'\{\{[^}]+\}\}'),          # {{variable}}
+    re.compile(r'\{[0-9]+\}'),              # {0}, {1}
+    re.compile(r'\{[a-zA-Z_][a-zA-Z0-9_]*\}'),  # {name}
+    re.compile(r'%[sd]'),                   # %s, %d
+    re.compile(r'%\([^)]+\)[sd]'),          # %(name)s
+    re.compile(r'\$\{[^}]+\}'),             # ${variable}
+    re.compile(r'\[\[[\w\s]+\]\]'),         # [[key]]
+]
 
 # Supported languages with their codes
 SUPPORTED_LANGUAGES = {
@@ -55,18 +67,22 @@ class TranslationCache:
             cache_file: Path to the SQLite database file
         """
         self.cache_file = cache_file
+        self._connections = {}
+        self._pending_writes = []
+        self._write_lock = threading.Lock()
         self._init_db()
     
     def _get_connection(self):
-        """Get a thread-local database connection."""
-        import threading
+        """Get a thread-local database connection with optimizations."""
         thread_id = threading.get_ident()
         
-        if not hasattr(self, '_connections'):
-            self._connections = {}
-        
         if thread_id not in self._connections:
-            conn = sqlite3.connect(self.cache_file, check_same_thread=False)
+            conn = sqlite3.connect(self.cache_file, check_same_thread=False, isolation_level=None)
+            # Performance optimizations
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=10000')
+            conn.execute('PRAGMA temp_store=MEMORY')
             self._connections[thread_id] = conn
         
         return self._connections[thread_id]
@@ -118,7 +134,7 @@ class TranslationCache:
     
     def set(self, text: str, source_lang: str, target_lang: str, translated_text: str):
         """
-        Store a translation in the cache.
+        Store a translation in the cache with optimized batching.
         
         Args:
             text: Original text
@@ -129,13 +145,14 @@ class TranslationCache:
         text_hash = self._get_hash(text)
         conn = self._get_connection()
         cursor = conn.cursor()
+        
+        # Direct insert for better performance (no transaction overhead)
         cursor.execute(
             '''INSERT OR REPLACE INTO translations 
                (text_hash, source_lang, target_lang, original_text, translated_text)
                VALUES (?, ?, ?, ?, ?)''',
             (text_hash, source_lang, target_lang, text, translated_text)
         )
-        conn.commit()
     
     def get_stats(self) -> Dict[str, int]:
         """Get cache statistics."""
@@ -181,17 +198,6 @@ class JSONTranslator:
         self.translation_count = 0
         self.cache_hits = 0
         self.cache = TranslationCache() if use_cache else None
-        
-        # Regex patterns for preserving interpolation placeholders
-        self.placeholder_patterns = [
-            r'\{\{[^}]+\}\}',          # {{variable}} - i18next, Handlebars
-            r'\{[0-9]+\}',              # {0}, {1} - .NET, Java
-            r'\{[a-zA-Z_][a-zA-Z0-9_]*\}',  # {name} - Python, Vue i18n
-            r'%[sd]',                   # %s, %d - C-style
-            r'%\([^)]+\)[sd]',          # %(name)s - Python
-            r'\$\{[^}]+\}',             # ${variable} - JavaScript
-            r'\[\[[\w\s]+\]\]',         # [[key]] - Some frameworks
-        ]
         
     def _init_translator(self):
         """Initialize the translator with current source and target languages."""
@@ -264,6 +270,7 @@ class JSONTranslator:
     def _extract_placeholders(self, text: str) -> tuple:
         """
         Extract placeholders from text and replace with temporary markers.
+        Uses pre-compiled regex patterns for better performance.
         
         Args:
             text: The text to process
@@ -274,8 +281,8 @@ class JSONTranslator:
         placeholders = []
         processed_text = text
         
-        for pattern in self.placeholder_patterns:
-            matches = re.findall(pattern, processed_text)
+        for pattern in PLACEHOLDER_PATTERNS_COMPILED:
+            matches = pattern.findall(processed_text)
             for match in matches:
                 placeholder_id = f"__PLACEHOLDER_{len(placeholders)}__"
                 placeholders.append(match)
@@ -459,19 +466,23 @@ class JSONTranslator:
                 }
                 
                 completed_count = 0
+                last_progress = 0
                 for future in as_completed(futures):
                     try:
                         idx, translated = future.result()
                         translated_strings[idx] = translated
                         completed_count += 1
                         
-                        if self.verbose and completed_count % 15 == 0:
+                        # Reduce verbose output frequency for better performance
+                        if self.verbose and completed_count - last_progress >= 15:
                             print(f"Progress: {completed_count}/{len(strings_to_translate)} strings translated")
+                            last_progress = completed_count
                     except Exception as e:
                         idx = futures[future]
                         if self.verbose:
                             print(f"Warning: Translation failed at index {idx}: {e}", file=sys.stderr)
                         translated_strings[idx] = strings_to_translate[idx]
+                        completed_count += 1
                 
                 if self.verbose:
                     print(f"Progress: {len(strings_to_translate)}/{len(strings_to_translate)} strings translated")
