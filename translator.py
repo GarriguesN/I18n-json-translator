@@ -194,7 +194,8 @@ class JSONTranslator:
             
             return translated
         except Exception as e:
-            print(f"Warning: Failed to translate '{text[:50]}...': {str(e)}", file=sys.stderr)
+            if self.verbose:
+                print(f"Warning: Failed to translate '{text[:50]}...': {str(e)}", file=sys.stderr)
             return text  # Return original text on failure
     
     def translate_json(self, data: Any) -> Any:
@@ -355,6 +356,7 @@ Examples:
                 target_lang=target_lang,
                 verbose=args.verbose
             )
+            
             translator.translate_file(input_path, output_path)
             
             print(f"✓ Saved to: {output_path}")
